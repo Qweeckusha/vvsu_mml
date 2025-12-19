@@ -1,15 +1,18 @@
-# safe_page_parser_fixed.py
-import requests
-import time
+import asyncio
 import random
 import os
+from pathlib import Path
+from urllib.parse import urljoin
+import httpx
 from bs4 import BeautifulSoup
 
-# === Настройки ===
+# === Конфигурация ===
 BASE_URL = "https://www.newsvl.ru/"
-OUTPUT_FILE = "collected_links.txt"
-START_PAGE = 1
-END_PAGE = 3020
+OUTPUT_FILE = Path("raw_vl_links.txt")
+START_PAGE = 2664
+END_PAGE = 3090
+NUM_WORKERS = 3
+DELAY_RANGE = (1.0, 2.0)  # на каждый запрос
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -17,80 +20,89 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 YaBrowser/25.6.1.1000 Yowser/2.5 Safari/537.36",
 ]
 
-DELAY_RANGE = (3.0, 7.0)
+# Глобальное множество (потокобезопасно в asyncio, так как один поток)
+collected_links = set()
+collected_links_lock = asyncio.Lock()
 
-def extract_news_links_from_page(html):
-    """Извлекает ТОЛЬКО ссылки из <h3 class="story-list__item-title"><a href="...">"""
-    soup = BeautifulSoup(html, 'html.parser')
-    links = []
-    for h3 in soup.find_all('h3', class_='story-list__item-title'):
-        a = h3.find('a', href=True)
-        if a:
-            href = a['href'].strip()
-            if href.startswith('/'):
-                href = BASE_URL.rstrip('/') + href
-            links.append(href)
-    return links
-
+# === Загрузка существующих ссылок ===
 def load_existing_links():
-    """Загружает существующие ссылки из файла (если он есть)"""
-    if os.path.exists(OUTPUT_FILE):
-        with open(OUTPUT_FILE, 'r', encoding='utf-8') as f:
+    if OUTPUT_FILE.exists():
+        with open(OUTPUT_FILE, encoding="utf-8") as f:
             return set(line.strip() for line in f if line.strip())
     else:
-        # Создаём пустой файл, если его нет
-        open(OUTPUT_FILE, 'w', encoding='utf-8').close()
+        OUTPUT_FILE.write_text("")
         return set()
 
+# === Сохранение ===
 def save_links(links):
-    """Перезаписывает файл всеми уникальными ссылками"""
-    with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
+    with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         for link in sorted(links):
-            f.write(link + '\n')
+            f.write(link + "\n")
 
-def main():
-    all_links = load_existing_links()
-    print(f"📥 Загружено {len(all_links)} ранее собранных ссылок")
+# === Извлечение ссылок ===
+def extract_news_links(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links = []
+    for h3 in soup.find_all("h3", class_="story-list__item-title"):
+        a = h3.find("a", href=True)
+        if a:
+            full_url = urljoin(BASE_URL, a["href"].strip())
+            links.append(full_url)
+    return links
 
-    for page in range(START_PAGE, END_PAGE + 1):
-        print(f"\n📄 Страница {page} из {END_PAGE}")
+# === Воркер ===
+async def worker(worker_id: int, page_queue: asyncio.Queue, client: httpx.AsyncClient):
+    while not page_queue.empty():
+        page = await page_queue.get()
         url = f"{BASE_URL}?page={page}"
 
-        headers = {
-            "User-Agent": random.choice(USER_AGENTS),
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Accept-Encoding": "gzip, deflate",
-            "Connection": "keep-alive",
-        }
-
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
         try:
-            resp = requests.get(url, headers=headers, timeout=15)
+            resp = await client.get(url, headers=headers, timeout=15.0)
+
             if resp.status_code == 200:
-                links = extract_news_links_from_page(resp.text)
-                new_links = [link for link in links if link not in all_links]
-                all_links.update(links)
-                print(f"   ➕ Найдено {len(links)} ссылок ({len(new_links)} новых)")
+                new_links = extract_news_links(resp.text)
+                async with collected_links_lock:
+                    before = len(collected_links)
+                    collected_links.update(new_links)
+                    added = len(collected_links) - before
+                    print(f"[{worker_id}] Страница {page}: +{len(new_links)} ссылок ({added} новых)")
+                    save_links(collected_links)
             else:
-                print(f"   ⚠️ HTTP {resp.status_code}")
-                if resp.status_code == 429 or resp.status_code >= 500:
-                    print("   💤 Пауза на 10 секунд из-за ошибки...")
-                    time.sleep(10)
+                print(f"[{worker_id}] Страница {page}: HTTP {resp.status_code}")
+                if resp.status_code in (429, 500, 502, 503):
+                    await asyncio.sleep(10)
 
         except Exception as e:
-            print(f"   ❌ Ошибка: {e}")
-            print("   💤 Пауза на 15 секунд...")
-            time.sleep(15)
+            print(f"[{worker_id}] Ошибка на странице {page}: {e}")
+            await asyncio.sleep(10)
 
-        # Сохраняем после каждой страницы
-        save_links(all_links)
-
-        # Человеческая задержка
+        # Задержка между запросами — критически важна
         delay = random.uniform(*DELAY_RANGE)
-        print(f"   ⏳ Пауза: {delay:.1f} сек...")
-        time.sleep(delay)
+        await asyncio.sleep(delay)
 
-    print(f"\n✅ Всего собрано: {len(all_links)} уникальных ссылок")
+        page_queue.task_done()
+
+# === Главная функция ===
+async def main():
+    global collected_links
+    collected_links = load_existing_links()
+    print(f"📥 Загружено {len(collected_links)} ранее собранных ссылок")
+
+    # Очередь страниц
+    page_queue = asyncio.Queue()
+    for page in range(START_PAGE, END_PAGE + 1):
+        page_queue.put_nowait(page)
+
+    # Запуск воркеров
+    async with httpx.AsyncClient(http2=True, timeout=15.0) as client:
+        workers = [
+            asyncio.create_task(worker(i + 1, page_queue, client))
+            for i in range(NUM_WORKERS)
+        ]
+        await asyncio.gather(*workers)
+
+    print(f"\n✅ Всего собрано: {len(collected_links)} уникальных ссылок")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

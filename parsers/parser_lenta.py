@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import httpx
 from bs4 import BeautifulSoup
 import sqlite3
-from urllib.parse import urlparse
+import xml.etree.ElementTree as ET
 
 # === Конфигурация ===
 USER_AGENTS = [
@@ -18,30 +18,33 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
 ]
 
-URLS_FILE = "article_links.txt"
-DONE_FILE = Path("done.txt")
-DEAD_FILE = Path("dead_links.txt")
-DB_PATH = "news.db"
+SITEMAP_FILE = "sitemap2.xml"
+DONE_FILE = Path("done_lenta.txt")
+DEAD_FILE = Path("dead_links_lenta.txt")
+DB_PATH = "lenta.db"
 REQUEST_TIMEOUT = 15
+NUM_WORKERS = 20
+DELAY_RANGE = (2, 3)
 
 client: httpx.AsyncClient
 
 
-# === Извлечение даты из URL для сортировки ===
-def extract_date_for_sort(url: str):
-    """Извлекает (год, месяц, день) из URL вида /2021/10/28/ для сортировки. Возвращает кортеж или (0,0,0) при ошибке."""
-    try:
-        path = urlparse(url).path.strip("/")
-        parts = path.split("/")
-        if len(parts) >= 5:
-            year = int(parts[-5])
-            month = int(parts[-4])
-            day = int(parts[-3])
-            if 2000 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
-                return (year, month, day)
-    except (ValueError, IndexError):
-        pass
-    return (0, 0, 0)  # ссылки без даты — в конец
+# === Парсинг XML sitemap ===
+def load_urls_from_sitemap(filepath: str) -> list[str]:
+    with open(filepath, encoding="utf-8") as f:
+        content = f.read()
+    # Удаляем namespace, если есть
+    content = re.sub(r' xmlns="[^"]+"', '', content, count=1)
+    root = ET.fromstring(content)
+
+    urls = []
+    for url_tag in root.findall(".//url"):
+        loc = url_tag.find("loc")
+        if loc is not None and loc.text:
+            url = loc.text.strip()
+            if url:
+                urls.append(url)
+    return urls
 
 
 # === Инициализация БД ===
@@ -89,53 +92,61 @@ def save_article(data):
 # === Очистка текста ===
 def clean_text(html_content: str) -> str:
     soup = BeautifulSoup(html_content, "lxml")
-    for tag in soup.select("img, video, audio, iframe, figure, script, style"):
+    for tag in soup.select("img, video, audio, iframe, figure, script, style, .topic-body__content-foot"):
         tag.decompose()
-    text = soup.get_text(separator="\n", strip=True)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Извлекаем только <p> с текстом
+    paragraphs = soup.select("p.topic-body__content-text")
+    text = "\n".join(p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True))
     return text.strip()
 
 
-# === Парсинг статьи ===
+# === Парсинг даты из строки вида "15:37, 10 октября 2012" ===
+def parse_lenta_date(date_str: str) -> str | None:
+    ru_months = {
+        "января": "01", "февраля": "02", "марта": "03", "апреля": "04",
+        "мая": "05", "июня": "06", "июля": "07", "августа": "08",
+        "сентября": "09", "октября": "10", "ноября": "11", "декабря": "12"
+    }
+    for ru, num in ru_months.items():
+        date_str = date_str.replace(ru, num)
+    try:
+        dt = datetime.strptime(date_str, "%H:%M, %d %m %Y")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+# === Парсинг статьи с lenta.ru ===
 def parse_article(html: str, url: str) -> dict | None:
     soup = BeautifulSoup(html, "lxml")
 
-    # Обязательные блоки: заголовок и текст
-    title_tag = soup.select_one("h1.story__title")
-    text_container = soup.select_one("div.story__text")
-
-    if not title_tag or not text_container:
-        print(f"  → Пропущено: отсутствует заголовок или текст-контейнер на {url}")
+    # Заголовок
+    title_span = soup.select_one("h1.topic-body__titles > span.topic-body__title")
+    if not title_span:
+        print(f"  → Пропущено: нет заголовка на {url}")
         return None
-
-    title = title_tag.get_text(strip=True)
+    title = title_span.get_text(strip=True)
     if not title:
         print(f"  → Пропущено: пустой заголовок на {url}")
         return None
 
-    # Очистка текста
-    description = clean_text(str(text_container))
-    if not description:
-        print(f"  → Пропущено: текст статьи пуст после очистки на {url}")
+    # Текст
+    content_div = soup.select_one("div.topic-body__content.js-topic-body-content")
+    if not content_div:
+        print(f"  → Пропущено: нет контейнера текста на {url}")
         return None
 
-    # Парсинг даты
+    description = clean_text(str(content_div))
+    if not description:
+        print(f"  → Пропущено: текст пуст на {url}")
+        return None
+
+    # Дата
+    time_tag = soup.select_one("a.topic-header__item.topic-header__time")
     published_at = None
-    date_tag = soup.select_one("span.story__info-date")
-    if date_tag:
-        date_str = date_tag.get_text(strip=True)
-        ru_months = {
-            "января": "01", "февраля": "02", "марта": "03", "апреля": "04",
-            "мая": "05", "июня": "06", "июля": "07", "августа": "08",
-            "сентября": "09", "октября": "10", "ноября": "11", "декабря": "12"
-        }
-        for ru, num in ru_months.items():
-            date_str = date_str.replace(ru, num)
-        try:
-            dt = datetime.strptime(date_str, "%H:%M, %d %m %Y")
-            published_at = dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
-            pass  # остаётся None
+    if time_tag:
+        date_text = time_tag.get_text(strip=True)
+        published_at = parse_lenta_date(date_text)
 
     return {
         "guid": str(uuid.uuid4()),
@@ -161,7 +172,6 @@ async def worker(worker_id: int, url_queue: asyncio.Queue):
                 print(f"[{worker_id}] 404 — мёртвая ссылка: {url}")
                 with open(DEAD_FILE, "a", encoding="utf-8") as f:
                     f.write(url + "\n")
-                # Не добавляем в done.txt — но и не обрабатываем
                 url_queue.task_done()
                 continue
 
@@ -173,7 +183,7 @@ async def worker(worker_id: int, url_queue: asyncio.Queue):
             article = parse_article(resp.text, url)
             if article:
                 save_article(article)
-                print(f"[{worker_id}] Сохранено: {article['title'][:60]}...")
+                print(f"[{worker_id}] Сохранено: {article['title'][:40]}... {article['url']}")
             else:
                 print(f"[{worker_id}] Пропущено (пусто): {url}")
 
@@ -183,7 +193,7 @@ async def worker(worker_id: int, url_queue: asyncio.Queue):
         except Exception as e:
             print(f"[{worker_id}] Ошибка на {url}: {e}")
 
-        delay = random.uniform(0.8, 1.5)
+        delay = random.uniform(*DELAY_RANGE)
         await asyncio.sleep(delay)
         url_queue.task_done()
 
@@ -193,47 +203,32 @@ async def main():
     global client
     init_db()
 
-    # Загрузка всех ссылок
-    with open(URLS_FILE, encoding="utf-8") as f:
-        raw_urls = [line.strip() for line in f if line.strip()]
+    # Загрузка URL из XML
+    all_urls = load_urls_from_sitemap(SITEMAP_FILE)
+    unique_urls = list(dict.fromkeys(all_urls))
+    print(f"📥 Всего уникальных URL из sitemap: {len(unique_urls)}")
 
-    # Уникальность + сортировка по дате из URL
-    unique_urls = list(dict.fromkeys(raw_urls))  # сохраняем порядок, убираем дубли
-    print(f"Всего уникальных ссылок: {len(unique_urls)}")
+    # Прогресс
+    done = set(DONE_FILE.read_text().splitlines()) if DONE_FILE.exists() else set()
+    dead = set(DEAD_FILE.read_text().splitlines()) if DEAD_FILE.exists() else set()
 
-    # Сортируем: сначала по дате из URL, затем остальные
-    sorted_urls = sorted(unique_urls, key=extract_date_for_sort)
-
-    # Загрузка прогресса
-    done = set()
-    if DONE_FILE.exists():
-        with open(DONE_FILE, encoding="utf-8") as f:
-            done = set(line.strip() for line in f)
-
-    dead = set()
-    if DEAD_FILE.exists():
-        with open(DEAD_FILE, encoding="utf-8") as f:
-            dead = set(line.strip() for line in f)
-
-    # Фильтрация: только не обработанные и не мёртвые
-    to_process = [url for url in sorted_urls if url not in done and url not in dead]
+    to_process = [url for url in unique_urls if url not in done and url not in dead]
+    print(f"⏳ К обработке: {len(to_process)} ссылок")
 
     if not to_process:
-        print("Нет ссылок для обработки.")
+        print("✅ Всё уже обработано.")
         return
 
-    print(f"К обработке: {len(to_process)} статей (из {len(sorted_urls)})")
-
     # Очередь
-    url_queue = asyncio.Queue()
+    queue = asyncio.Queue()
     for url in to_process:
-        url_queue.put_nowait(url)
+        queue.put_nowait(url)
 
     # Запуск
     async with httpx.AsyncClient(http2=True, timeout=REQUEST_TIMEOUT) as client:
         workers = [
-            asyncio.create_task(worker(1, url_queue)),
-            asyncio.create_task(worker(2, url_queue)),
+            asyncio.create_task(worker(i + 1, queue))
+            for i in range(NUM_WORKERS)
         ]
         await asyncio.gather(*workers)
 
